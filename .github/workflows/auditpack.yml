@@ -1,0 +1,111 @@
+name: AuditPack ZIP (10min demo)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-auditpack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare folders
+        run: |
+          mkdir -p evidence mapping replay integrity
+
+      # SBOM (CycloneDX JSON)
+      - name: SBOM via Syft
+        uses: anchore/syft-action@v0.17.0
+        with:
+          path: "."
+          output: "cyclonedx-json=evidence/sbom.json"
+
+      # Vulnerability scan (repo files)
+      - name: Trivy filesystem scan (JSON)
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          scan-type: 'fs'
+          format: 'json'
+          output: 'evidence/vulns.json'
+          ignore-unfixed: true
+
+      # Secrets scan (JSON)
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --source . --report-format json --report-path evidence/secrets.json || true
+
+      # Minimal SSDF mapping (sample)
+      - name: Create SSDF mapping sample
+        run: |
+          cat > mapping/ssdf.yaml << 'YAML'
+          mappings:
+            - framework: NIST SSDF v1.1
+              links:
+                CTRL-02: ["PS.3.1","PW.6.2"]
+                CTRL-03: ["RV.1.1","RV.3.2"]
+                CTRL-04: ["PW.10.1"]
+          YAML
+
+      # Replay (store minimal workflow + rerun script)
+      - name: Create replay files
+        run: |
+          cat > replay/workflow.yml << 'YAML'
+          name: demo
+          on: workflow_dispatch
+          jobs:
+            demo:
+              runs-on: ubuntu-latest
+              steps:
+                - run: echo "This is a demo workflow for replay/"
+          YAML
+          cat > replay/rerun.sh << 'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          out="${OUTPUT_DIR:-./out}"
+          mkdir -p "$out"
+          echo '{"rerun":"ok"}' > "$out/rerun-output.json"
+          SH
+          chmod +x replay/rerun.sh
+
+      # Manifest.json（生成情報）
+      - name: Create manifest.json
+        run: |
+          ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          cat > manifest.json << JSON
+          {
+            "version": "0.1",
+            "generated_at": "$ts",
+            "git": { "commit": "${GITHUB_SHA}", "repo": "${GITHUB_REPOSITORY}" },
+            "tools": ["syft","trivy","gitleaks"]
+          }
+          JSON
+
+      # Hash list（改ざん検知用）
+      - name: Create manifest.sha256
+        run: |
+          {
+            sha256sum manifest.json
+            sha256sum evidence/sbom.json
+            sha256sum evidence/vulns.json
+            sha256sum evidence/secrets.json
+            sha256sum mapping/ssdf.yaml
+            sha256sum replay/workflow.yml
+          } > integrity/manifest.sha256
+
+      # ZIPに束ねる
+      - name: Build auditpack.zip
+        run: |
+          zip -r auditpack.zip \
+            manifest.json \
+            evidence mapping replay integrity
+
+      # アーティファクトに保存（ダウンロード用）
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: auditpack
+          path: auditpack.zip
