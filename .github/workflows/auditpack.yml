@@ -1,20 +1,32 @@
-name: AuditPack ZIP (10min demo)
+name: AuditPack ZIP (prod-min)
 
 on:
   workflow_dispatch:
   push:
     branches: [ main, master ]
 
+permissions:           # 最小権限
+  contents: read
+  actions: read
+
+concurrency:           # 二重起動を抑止
+  group: auditpack-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-auditpack:
     runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.classify.outputs.result }}
+      artifact_name: ${{ steps.namezip.outputs.artifact_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare folders
+      - name: Prepare
         run: |
           mkdir -p evidence mapping replay integrity
+          sudo apt-get update -y && sudo apt-get install -y jq
 
       # SBOM (CycloneDX JSON)
       - name: SBOM via Syft
@@ -23,8 +35,8 @@ jobs:
           path: "."
           output: "cyclonedx-json=evidence/sbom.json"
 
-      # Vulnerability scan (repo files)
-      - name: Trivy filesystem scan (JSON)
+      # Vulnerability (Trivy)
+      - name: Trivy filesystem scan
         uses: aquasecurity/trivy-action@0.20.0
         with:
           scan-type: 'fs'
@@ -32,14 +44,14 @@ jobs:
           output: 'evidence/vulns.json'
           ignore-unfixed: true
 
-      # Secrets scan (JSON)
+      # Secrets (Gitleaks)
       - name: Gitleaks
         uses: gitleaks/gitleaks-action@v2
         with:
           args: detect --source . --report-format json --report-path evidence/secrets.json || true
 
-      # Minimal SSDF mapping (sample)
-      - name: Create SSDF mapping sample
+      # SSDF mapping（雛形）
+      - name: SSDF mapping sample
         run: |
           cat > mapping/ssdf.yaml << 'YAML'
           mappings:
@@ -50,8 +62,8 @@ jobs:
                 CTRL-04: ["PW.10.1"]
           YAML
 
-      # Replay (store minimal workflow + rerun script)
-      - name: Create replay files
+      # 再現ファイル
+      - name: Replay files
         run: |
           cat > replay/workflow.yml << 'YAML'
           name: demo
@@ -60,7 +72,7 @@ jobs:
             demo:
               runs-on: ubuntu-latest
               steps:
-                - run: echo "This is a demo workflow for replay/"
+                - run: echo "replay demo"
           YAML
           cat > replay/rerun.sh << 'SH'
           #!/usr/bin/env bash
@@ -71,8 +83,8 @@ jobs:
           SH
           chmod +x replay/rerun.sh
 
-      # Manifest.json（生成情報）
-      - name: Create manifest.json
+      # 生成情報
+      - name: Manifest
         run: |
           ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           cat > manifest.json << JSON
@@ -84,8 +96,8 @@ jobs:
           }
           JSON
 
-      # Hash list（改ざん検知用）
-      - name: Create manifest.sha256
+      # 改ざん検知（ハッシュ）
+      - name: Hash list (sha256)
         run: |
           {
             sha256sum manifest.json
@@ -96,16 +108,77 @@ jobs:
             sha256sum replay/workflow.yml
           } > integrity/manifest.sha256
 
-      # ZIPに束ねる
-      - name: Build auditpack.zip
+      # ◇ 簡易ガード：High/Criticalが1件以上ならNGで落とす
+      - name: Gate (fail on HIGH/CRITICAL)
+        id: gate
         run: |
-          zip -r auditpack.zip \
-            manifest.json \
-            evidence mapping replay integrity
+          total=$(jq '[.. | objects? | select(.Severity=="HIGH" or .Severity=="CRITICAL")] | length' evidence/vulns.json)
+          echo "found=$total"
+          if [ "${total:-0}" -ge 1 ]; then
+            echo "gate_status=NG" >> $GITHUB_OUTPUT
+            echo "::error ::High/Critical vulnerabilities: $total"
+            exit 1
+          else
+            echo "gate_status=OK" >> $GITHUB_OUTPUT
+          fi
 
-      # アーティファクトに保存（ダウンロード用）
+      # ZIP化
+      - name: Name artifact
+        id: namezip
+        run: |
+          NAME="auditpack_${GITHUB_RUN_NUMBER}.zip"
+          echo "artifact_name=$NAME" >> $GITHUB_OUTPUT
+      - name: Build ZIP
+        run: |
+          zip -r "${{ steps.namezip.outputs.artifact_name }}" \
+            manifest.json evidence mapping replay integrity
+
+      # 分類（OK/NG/UNEXPECTED）…最低限：構造＋ハッシュが通っていればOK
+      - name: Classify result
+        id: classify
+        if: always()
+        run: |
+          res="OK"
+          # 構造チェック
+          for f in manifest.json integrity/manifest.sha256 replay/workflow.yml; do [ -f "$f" ] || res="NG"; done
+          for d in evidence mapping replay integrity; do [ -d "$d" ] || res="NG"; done
+          # ゲートNGならNG
+          if [ "${{ steps.gate.outcomes || '' }}" = "failure" ] || [ "${{ steps.gate.outputs.gate_status }}" = "NG" ]; then res="NG"; fi
+          echo "result=$res" >> $GITHUB_OUTPUT
+
+      # アーティファクト保存（保持日数=30日はお好みで）
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: auditpack
-          path: auditpack.zip
+          name: ${{ steps.namezip.outputs.artifact_name }}
+          path: ${{ steps.namezip.outputs.artifact_name }}
+          retention-days: 30
+
+  triage-on-ng:
+    needs: build-auditpack
+    if: needs.build-auditpack.outputs.result != 'OK'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open an Issue for NG
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const result = '${{ needs.build-auditpack.outputs.result }}';
+            const artifact = '${{ needs.build-auditpack.outputs.artifact_name }}';
+            const body = [
+              `結果: **${result}**`,
+              `Artifact: ${artifact}`,
+              '',
+              '対処:',
+              '- TrivyのHIGH/CRITICALを是正',
+              '- manifest.sha256の再生成（ワークフロー再実行）',
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[AuditPack] NG: run #${context.runNumber}`,
+              body
+            });
